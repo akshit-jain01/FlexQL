@@ -1,0 +1,489 @@
+g++ -Iinclude \
+src/server/server.cpp \
+src/parser/parser.cpp \
+src/query/executor.cpp \
+src/cache/lru_cache.cpp \
+-o bin/server
+
+g++ -Iinclude src/client/client.cpp -o bin/client
+
+
+
+join not working properly right now, else remaining:
+1. add support for if exists
+
+
+g++ -Iinclude benchmark.cpp src/flexql/flexql.cpp -o bin/benchmark
+g++ -Iinclude benchmark_flexql.cpp src/flexql/flexql.cpp -o bench2
+
+#include "query/executor.h"
+#include "storage/table.h"
+#include "cache/lru_cache.h"
+#include <map>
+#include <vector>
+#include <mutex>
+
+using namespace std;
+
+static unordered_map<string, Table> database;
+static thread_local LRUCache query_cache(100);
+// static atomic<long> hits{0};
+
+bool check_cache(const string& raw_query, string& result) {
+    
+//     if (found) {
+//         if (++hits % 1000000 == 0)
+//         fprintf(stderr, "cache hits: %ld\n", hits.load());
+// }
+    return query_cache.get(raw_query, result);
+}
+
+string execute_query_obj(const Query& q, const string& raw_query) {
+
+    if (q.type == UNKNOWN) {
+        return "Error: Invalid query\n##END##\n";
+    }
+
+
+    string cached_result;
+
+    // Only cache SELECT queries
+
+    if (q.type != CREATE) {
+        if (database.find(q.table_name) == database.end()) {
+            return "Error: Table not found\n##END##\n";
+        }
+    }
+
+    if (q.type == CREATE) {
+
+        if (database.find(q.table_name) != database.end()) {
+            return "Error: Table already exists\n##END##\n";
+        }
+        Table t;
+        t.columns = q.columns;
+        t.types = q.types;
+         for (int i = 0; i < t.columns.size(); i++) {
+            t.col_index[t.columns[i]] = i;
+        }
+        database[q.table_name] = t;
+       
+        return "Table created\n##END##\n";
+    }
+
+    else if (q.type == INSERT) {
+
+        auto &table = database[q.table_name];
+
+        if (q.values.size() != table.columns.size()) {
+            return "Error: Column count mismatch\n##END##\n";
+        }
+
+        //  ADD TYPE VALIDATION HERE
+        for (int i = 0; i < q.values.size(); i++) {
+
+            string type = table.types[i];
+            string val = q.values[i];
+
+            if (type == "INT") {
+                for (char c : val) {
+                    if (!isdigit(c)) return "Error: Invalid INT value\n##END##\n";
+                }
+            }
+
+            else if (type == "DECIMAL") {
+                bool dot = false;
+                for (char c : val) {
+                    if (c == '.') {
+                        if (dot) return "Error: Invalid DECIMAL\n##END##\n";
+                        dot = true;
+                    } else if (!isdigit(c)) {
+                        return "Error: Invalid DECIMAL\n##END##\n";
+                    }
+                }
+            }
+
+            else if (type == "VARCHAR") {
+                // allow anything
+            }
+
+            else if (type == "DATETIME") {
+                // simple YYYY-MM-DD check
+                if (val.size() != 10 || val[4] != '-' || val[7] != '-') {
+                    return "Error: Invalid DATETIME format\n##END##\n";
+                }
+            }
+        }
+
+        // existing logic (unchanged)
+        string primary_key = q.values[0];
+
+        if (table.index.count(primary_key)) {
+            return "Error: Duplicate primary key\n##END##\n";
+        }
+
+        //  if using TTL Row struct → adjust accordingly
+        // Row new_row;
+        // new_row.data = q.values;
+        // new_row.expiry = time(nullptr) + 300; // optional TTL
+
+        // table.rows.push_back(new_row);
+        table.rows.push_back(q.values);
+
+        //  build precomputed row string
+        string row_str;
+        for (auto &val : q.values)
+            row_str += val + " ";
+        row_str += "\n";
+
+        table.row_strings.push_back(row_str);
+
+        int row_id = table.rows.size() - 1;
+        table.index[primary_key] = row_id;
+
+        query_cache = LRUCache(100);
+
+        return "Row inserted\n##END##\n";
+    }
+
+    else if (q.type == SELECT) {
+        if (!q.is_join &&
+            q.where_column.empty() &&
+            (q.select_columns.empty() || q.select_columns[0] == "*")) {
+
+            if (query_cache.get(raw_query, cached_result)) {
+                return cached_result; 
+            }
+        }
+        if (q.is_join) {
+
+            if (database.find(q.join_table) == database.end()) {
+                return "Error: Join table not found\n##END##\n";
+            }
+
+            auto &table1 = database[q.table_name];
+            auto &table2 = database[q.join_table];
+
+            string result;
+
+
+            // Find column index in table1
+            // for (int i = 0; i < table1.columns.size(); i++) {
+            //     if (table1.columns[i] == q.join_col1) {
+            //         col1 = i;
+            //         break;
+            //     }
+            // }
+            if (!table1.col_index.count(q.join_col1) ||
+                !table2.col_index.count(q.join_col2)) {
+                return "Error: Join column not found\n##END##\n";
+            }
+            int col1 = table1.col_index[q.join_col1];
+
+            // Find column index in table2
+            int col2 = table2.col_index[q.join_col2];
+
+            
+
+            
+
+            // CROSS JOIN + FILTER
+            for (auto &row1 : table1.rows) {
+                for (auto &row2 : table2.rows) {
+
+                    if (row1[col1] == row2[col2]) {
+
+                        if (q.select_columns.empty() || q.select_columns[0] == "*") {
+
+                            for (auto &val : row1)
+                                result += val + " ";
+
+                            for (auto &val : row2)
+                                result += val + " ";
+
+                        } else {
+                            for (auto &col_name : q.select_columns) {
+
+                                if (table1.col_index.count(col_name)) {
+                                    result += row1[table1.col_index[col_name]] + " ";
+                                }
+                                else if (table2.col_index.count(col_name)) {
+                                    result += row2[table2.col_index[col_name]] + " ";
+                                }
+                            }
+                            // print only requested columns (from both tables)
+                            // for (auto &col_name : q.select_columns) {
+
+                            //     bool found = false;
+
+                            //     // search in table1
+                            //     for (int i = 0; i < table1.columns.size(); i++) {
+                            //         if (table1.columns[i] == col_name) {
+                            //             result += row1[i] + " ";
+                            //             found = true;
+                            //             break;
+                            //         }
+                            //     }
+
+                            //     // search in table2 if not found
+                            //     if (!found) {
+                            //         for (int i = 0; i < table2.columns.size(); i++) {
+                            //             if (table2.columns[i] == col_name) {
+                            //                 result += row2[i] + " ";
+                            //                 break;
+                            //             }
+                            //         }
+                            //     }
+                            // }
+                        }
+
+                        result += "\n";
+                    }
+                }
+            }
+
+            if (result.empty()) {
+                return "No matching records\n##END##\n";
+            }
+            result += "##END##\n";
+            query_cache.put(raw_query, result);
+            return result;
+            // return "";
+        }
+        string result;
+        
+        auto &table = database[q.table_name];
+        result.reserve(table.rows.size() * 50);
+
+        // If WHERE on primary key → use index
+        if (!q.where_column.empty() && q.where_column == table.columns[0]) {
+
+            if (table.index.find(q.where_value) != table.index.end()) {
+                int row_id = table.index[q.where_value];
+                auto &row = table.rows[row_id];
+
+                if (q.select_columns.empty() || q.select_columns[0] == "*") {
+
+                    for (auto &val : row)
+                        result += val + " ";
+
+                } else {
+
+                    for (auto &col_name : q.select_columns) {
+
+                        if (table.col_index.count(col_name)) {
+                            result += row[table.col_index[col_name]] + " ";
+                        }
+                    }
+                }
+
+                result += "##END##\n";
+                query_cache.put(raw_query, result);
+                return result;
+                // return "";
+            }
+            else {
+                return "No matching record\n##END##\n";
+            }
+        }
+
+        // Otherwise fallback → full scan
+            // if (q.select_columns.empty() || q.select_columns[0] == "*") {
+
+            //     for (auto &val : row)
+            //         result += val + " ";
+
+            // } else {
+
+            //     for (auto &col_name : q.select_columns) {
+
+            //         int col_index = -1;
+
+            //         for (int i = 0; i < table.columns.size(); i++) {
+            //             if (table.columns[i] == col_name) {
+            //                 col_index = i;
+            //                 break;
+            //             }
+            //         }
+
+            //         if (col_index != -1)
+            //             result += row[col_index] + " ";
+            //     }
+            // }
+            // result += "\n";
+            if (q.select_columns.empty() || q.select_columns[0] == "*") {
+
+                for (auto &row_str : table.row_strings)
+                    result += row_str;
+
+            } else {
+
+                for (auto &row : table.rows) {
+
+                    for (auto &col_name : q.select_columns) {
+                        if (table.col_index.count(col_name)) {
+                            result += row[table.col_index[col_name]] + " ";
+                        }
+                    }
+
+                    result += "\n";
+                }
+            }
+        
+
+        if (result.empty()) {
+            return "No matching records\n##END##\n";
+        }
+        result += "##END##\n";
+        query_cache.put(raw_query, result);
+        return result;
+        // return "";
+    }
+
+    return "Unknown query\n##END##\n";
+}
+
+
+
+#include "../../include/parser/parser.h"
+#include <sstream>
+#include <algorithm>
+
+using namespace std;
+
+vector<string> split(const string &s) {
+    vector<string> tokens;
+    stringstream ss(s);
+    string word;
+    while (ss >> word) tokens.push_back(word);
+    return tokens;
+}
+
+Query parse_query(const string& query_str) {
+    Query q;
+    auto tokens = split(query_str);
+
+    if (tokens[0] == "CREATE") {
+        q.type = CREATE;
+        size_t pos = tokens[2].find("(");
+
+        if (pos != string::npos)
+            q.table_name = tokens[2].substr(0, pos);
+        else
+            q.table_name = tokens[2];
+
+        // Simplified column parsing
+        size_t start = query_str.find("(");
+        size_t end = query_str.find(")");
+        string cols = query_str.substr(start + 1, end - start - 1);
+
+        stringstream ss(cols);
+        string col;
+        while (getline(ss, col, ',')) {
+
+            // trim
+            col.erase(0, col.find_first_not_of(" "));
+            col.erase(col.find_last_not_of(" ") + 1);
+
+            stringstream col_ss(col);
+
+            string col_name, col_type;
+            col_ss >> col_name >> col_type;
+
+            // convert type to uppercase (optional)
+            transform(col_type.begin(), col_type.end(), col_type.begin(), ::toupper);
+
+            // validate type
+            if (col_type != "INT" &&
+                col_type != "DECIMAL" &&
+                col_type != "VARCHAR" &&
+                col_type != "DATETIME") {
+
+                q.type = UNKNOWN;  // force error
+                return q;
+            }
+
+            q.columns.push_back(col_name);
+            q.types.push_back(col_type);
+        }
+    }
+
+    else if (tokens[0] == "INSERT") {
+        q.type = INSERT;
+        q.table_name = tokens[2];
+
+        size_t start = query_str.find("(");
+        size_t end = query_str.find(")");
+        string vals = query_str.substr(start + 1, end - start - 1);
+
+        stringstream ss(vals);
+        string val;
+        while (getline(ss, val, ',')) {
+            q.values.push_back(val);
+        }
+    }
+
+    else if (tokens[0] == "SELECT") {
+        q.type = SELECT;
+
+        // extract columns
+        size_t from_pos = query_str.find("FROM");
+
+        string cols_part = query_str.substr(7, from_pos - 7);
+
+        // trim
+        cols_part.erase(0, cols_part.find_first_not_of(" "));
+        cols_part.erase(cols_part.find_last_not_of(" ") + 1);
+
+        // split columns
+        stringstream ss(cols_part);
+        string col;
+
+        while (getline(ss, col, ',')) {
+            col.erase(0, col.find_first_not_of(" "));
+            col.erase(col.find_last_not_of(" ") + 1);
+            q.select_columns.push_back(col);
+        }
+
+        auto tokens = split(query_str);
+
+        q.table_name = tokens[3];
+
+        // 🔥 ================== ADD THIS ==================
+        for (int i = 0; i < tokens.size(); i++) {
+
+            if (tokens[i] == "JOIN") {
+                q.is_join = true;
+                q.join_table = tokens[i + 1];
+
+                // ON A.id = B.id
+                string left = tokens[i + 3];
+                string right = tokens[i + 5];
+
+                q.join_col1 = left.substr(left.find('.') + 1);
+                q.join_col2 = right.substr(right.find('.') + 1);
+
+                // trim (VERY IMPORTANT)
+                q.join_col1.erase(0, q.join_col1.find_first_not_of(" "));
+                q.join_col1.erase(q.join_col1.find_last_not_of(" ") + 1);
+
+                q.join_col2.erase(0, q.join_col2.find_first_not_of(" "));
+                q.join_col2.erase(q.join_col2.find_last_not_of(" ") + 1);
+            }
+        }
+        // 🔥 ============================================
+
+        // WHERE (only if not JOIN)
+        if (!q.is_join && tokens.size() > 4 && tokens[4] == "WHERE") {
+            q.where_column = tokens[5];
+            q.where_op = tokens[6];     // 🔥 ADD THIS LINE
+            q.where_value = tokens[7];
+        }
+    }
+
+    else {
+        q.type = UNKNOWN;
+    }
+
+    return q;
+}
